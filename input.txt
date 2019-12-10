@@ -1,0 +1,7 @@
+{"Login": {"version": 42, "login": "tester"}}
+{"Settings": {"quick_play": false, "side": "Spectator"}}
+{"Room": {"room_id": 228}}
+
+
+{"Login": {"version": 228, "login": "rogday"}}
+{"Settings": {"quick_play": true, "side": "OnlyX"}}
