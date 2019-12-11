@@ -3,5 +3,5 @@
 {"Room": {"room_id": 228}}
 
 
-{"Login": {"version": 228, "login": "rogday"}}
+{"Login": {"version": 28, "login": "rogday"}}
 {"Settings": {"quick_play": true, "side": "OnlyX"}}

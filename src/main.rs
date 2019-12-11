@@ -10,15 +10,15 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use futures::{SinkExt, Stream, StreamExt};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     env,
     error::Error,
-    hash::{Hash, Hasher},
+    //hash::{Hash, Hasher},
     io,
     net::SocketAddr,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
+    //sync::Arc,
     task::{Context, Poll},
 };
 
@@ -31,7 +31,7 @@ enum ClientMessage {
     Room { room_id: i64 },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum ServerMessage {
     Error(Option<String>),
     RoomInfo(SRoomInfo),
@@ -39,7 +39,7 @@ enum ServerMessage {
     Incoming(SClient),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum Side {
     PreferX,
     PreferO,
@@ -49,25 +49,25 @@ enum Side {
     Spectator,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct SClient {
     login: String,
     side: Side,
 }
 
 // CSettings <- SRoomInfo | SRooms
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct SRoomInfo {
     room_id: u64,
     players: Vec<SClient>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct SRooms {
     rooms: Vec<SRoomInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum ClientState {
     Mute,
     Logined,
@@ -76,7 +76,10 @@ enum ClientState {
     Playing,
 }
 
-fn progress(state: &mut ClientState, event: &ClientMessage) {
+async fn progress(peer_id: Token, event: &ClientMessage) {
+    let mut guard = SHARED_STATE.lock().await;
+    let peer_state = guard.clients[&peer_id].state;
+
     let playing_conditions = false;
 
     let playing_check = || {
@@ -87,12 +90,26 @@ fn progress(state: &mut ClientState, event: &ClientMessage) {
         }
     };
 
-    *state = match (&state, &event) {
-        (ClientState::Mute, ClientMessage::Login { .. }) => {
+    macro_rules! send {
+        ($msg:expr) => {{
+            let _ = guard.peers[&peer_id].send($msg);
+        }};
+    }
+
+    let new_state = match (&peer_state, &event) {
+        (ClientState::Mute, ClientMessage::Login { version, login }) => {
             //send(CError(format!("{}", version.is_recent())))
-            ClientState::Logined
+            if *version < 42 {
+                send!(ServerMessage::Error(Some(format!(
+                    "{}, your client version is less than required.",
+                    login
+                ))));
+                ClientState::Mute
+            } else {
+                ClientState::Logined
+            }
         }
-        (ClientState::Logined, ClientMessage::Settings { ref quick_play, .. }) => {
+        (ClientState::Logined, ClientMessage::Settings { quick_play, side }) => {
             if *quick_play {
                 //for i in rooms.public
                 // if playing_conditions{
@@ -106,6 +123,36 @@ fn progress(state: &mut ClientState, event: &ClientMessage) {
                 //--------------
                 playing_check()
             } else {
+                send!(ServerMessage::Rooms(SRooms {
+                    rooms: vec![
+                        SRoomInfo {
+                            room_id: 12,
+                            players: vec![
+                                SClient {
+                                    login: "fucker".into(),
+                                    side: Side::OnlyX
+                                },
+                                SClient {
+                                    login: "oh hi mark".into(),
+                                    side: Side::Random
+                                }
+                            ]
+                        },
+                        SRoomInfo {
+                            room_id: 99,
+                            players: vec![
+                                SClient {
+                                    login: "test".into(),
+                                    side: Side::Spectator
+                                },
+                                SClient {
+                                    login: "jesus".into(),
+                                    side: Side::PreferO
+                                }
+                            ]
+                        }
+                    ]
+                }));
                 ClientState::InLobby
                 //send SRooms
             }
@@ -117,18 +164,25 @@ fn progress(state: &mut ClientState, event: &ClientMessage) {
             playing_check()
         }
         _ => return,
-    }
+    };
+
+    guard.clients.get_mut(&peer_id).unwrap().state = new_state;
+}
+
+#[macro_use]
+extern crate lazy_static;
+
+// Create the shared state. This is how all the peers communicate.
+//
+// The server task will hold a handle to this. For every new client, the
+// `state` handle is cloned and passed into the task that processes the
+// client connection.
+lazy_static! {
+    static ref SHARED_STATE: Mutex<Shared> = Mutex::new(Shared::new());
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Create the shared state. This is how all the peers communicate.
-    //
-    // The server task will hold a handle to this. For every new client, the
-    // `state` handle is cloned and passed into the task that processes the
-    // client connection.
-    let state = Arc::new(Mutex::new(Shared::new()));
-
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:6142".to_string());
 
     // Bind a TCP listener to the socket address.
@@ -143,11 +197,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (stream, addr) = listener.accept().await?;
 
         // Clone a handle to the `Shared` state for the new connection.
-        let state = Arc::clone(&state);
+        //let state = Arc::clone(&SHARED_STATE);
 
         // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
-            if let Err(e) = process(state, stream, addr).await {
+            if let Err(e) = process(stream, addr).await {
                 println!("an error occured; error = {:?}", e);
             }
         });
@@ -173,12 +227,32 @@ static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(NULL_TOKEN + 1);
 /// iterating over the `peers` entries and sending a copy of the message on each
 /// `Tx`.
 struct Shared {
-    rooms: HashMap<Token, HashSet<Token>>,
-    clients: HashMap<Token, Peer>,
+    rooms: HashMap<Token, BTreeSet<Token>>,
+    peers: HashMap<Token, Tx>,
+    clients: HashMap<Token, Client>,
 }
 
+#[derive(Debug)]
+struct Client {
+    id: Token,
+
+    state: ClientState,
+    room: Token,
+}
+
+impl PartialEq for Client {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Client {}
+
 /// The state for each connected client.
+//#[derive(PartialEq, Eq, Debug)]
 struct Peer {
+    id: Token,
+
     /// The TCP socket wrapped with the `Lines` codec, defined below.
     ///
     /// This handles sending and receiving data on the socket. When using
@@ -190,30 +264,7 @@ struct Peer {
     ///
     /// This is used to receive messages from peers. When a message is received
     /// off of this `Rx`, it will be written to the socket.
-    tx: Tx,
     rx: Rx,
-
-    /// Peer state
-    state: ClientState,
-
-    /// peer id
-    id: Token,
-
-    /// What room is client in
-    room: Token,
-}
-
-impl PartialEq for Peer {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-impl Eq for Peer {}
-
-impl Hash for Peer {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
 }
 
 impl Shared {
@@ -221,29 +272,28 @@ impl Shared {
     fn new() -> Self {
         Shared {
             rooms: HashMap::new(),
+            peers: HashMap::new(),
             clients: HashMap::new(),
         }
     }
 
     // Send a `LineCodec` encoded message to every peer, except
     // for the sender.
-    // async fn broadcast(&mut self, sender: SocketAddr, message: String) {
-    //     for peer in self.peers.iter_mut() {
-    //         if *peer.0 != sender {
-    //             let _ = peer.1.send(message.clone());
-    //         }
-    //     }
-    // }
+    async fn broadcast(&mut self, room_id: Token, sender: Token, message: ServerMessage) {
+        for client_id in self.rooms[&room_id].iter() {
+            if *client_id != sender {
+                //sending in Tx for Rx to recieve
+                let _ = self.peers[client_id].send(message.clone());
+            }
+        }
+    }
 }
 
 impl Peer {
     /// Create a new instance of `Peer`.
-    async fn new(
-        state: Arc<Mutex<Shared>>,
-        lines: Framed<TcpStream, LinesCodec>,
-    ) -> io::Result<Token> {
+    async fn new(lines: Framed<TcpStream, LinesCodec>) -> io::Result<Peer> {
         // Get the client socket address
-        let addr = lines.get_ref().peer_addr()?;
+        //let addr = lines.get_ref().peer_addr()?;
 
         // Create a channel for this peer
         let (tx, rx) = mpsc::unbounded_channel();
@@ -251,21 +301,24 @@ impl Peer {
         // Add an entry for this `Peer` in the shared state map.
         //state.lock().await.peers.insert(addr, tx);
 
-        let p_id = PEER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let peer_id = PEER_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        state.lock().await.clients.insert(
-            p_id,
-            Peer {
-                id: p_id,
-                room: NULL_TOKEN,
-                lines: lines,
-                rx: rx,
-                tx: tx,
+        SHARED_STATE.lock().await.peers.insert(peer_id, tx);
+        SHARED_STATE.lock().await.clients.insert(
+            peer_id,
+            Client {
+                id: peer_id,
+
                 state: ClientState::Mute,
+                room: NULL_TOKEN,
             },
         );
 
-        Ok(p_id)
+        Ok(Peer {
+            id: peer_id,
+            lines,
+            rx,
+        })
     }
 }
 
@@ -319,16 +372,11 @@ impl Stream for Peer {
 }
 
 /// Process an individual client
-async fn process(
-    state: Arc<Mutex<Shared>>,
-    stream: TcpStream,
-    addr: SocketAddr,
-) -> Result<(), Box<dyn Error>> {
+async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Error>> {
     let lines = Framed::new(stream, LinesCodec::new());
 
     // Register our peer with state which internally sets up some channels.
-    let peer_id = Peer::new(state.clone(), lines).await?;
-    let peer = { &state.lock().await.clients[&peer_id] };
+    let mut peer = Peer::new(lines).await?;
 
     // A client has connected, let's let everyone know.
     {
@@ -344,10 +392,16 @@ async fn process(
             // A message was received from the current user, we should
             // broadcast this message to the other users.
             Ok(Message::FromClient(msg)) => {
-                //let mut state = state.lock().await;
                 //let msg = format!("{}: {}", username, msg);
-                progress(&mut peer.state, &msg);
-                println!("{} [{:?}] => {:?}", addr, msg, peer.state);
+                //let peer_state = &mut shared_state.clients.get_mut(&peer.id).unwrap().state;
+                progress(peer.id, &msg).await;
+
+                println!(
+                    "{} [{:?}] => {:?}",
+                    addr,
+                    msg,
+                    SHARED_STATE.lock().await.clients[&peer.id].state
+                );
 
                 //println!("#broadcast: sending '{}' from {}", msg, addr);
                 //state.broadcast(addr, msg).await;
@@ -372,8 +426,11 @@ async fn process(
     // If this section is reached it means that the client was disconnected!
     // Let's let everyone still connected know about it.
     {
-        let mut state = state.lock().await;
-        state.clients.remove(&peer_id);
+        let mut guard = SHARED_STATE.lock().await;
+
+        //maybe destructor of some kind??
+        guard.clients.remove(&peer.id);
+        guard.peers.remove(&peer.id);
 
         let msg = format!("{} has left the server", addr);
         println!("{}", msg);
