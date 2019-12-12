@@ -3,5 +3,8 @@
 {"Room": {"room_id": 228}}
 
 
-{"Login": {"version": 28, "login": "rogday"}}
+{"Login": {"version": 58, "login": "jesus"}}
 {"Settings": {"quick_play": true, "side": "OnlyX"}}
+
+{"Login": {"version": 228, "login": "rogday"}}
+{"Settings": {"quick_play": true, "side": "OnlyO"}}

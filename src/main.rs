@@ -39,10 +39,10 @@ enum ServerMessage {
     Incoming(SClient),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
-    PreferX,
-    PreferO,
+    //PreferX,
+    //PreferO,
     OnlyX,
     OnlyO,
     Random,
@@ -58,7 +58,7 @@ struct SClient {
 // CSettings <- SRoomInfo | SRooms
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SRoomInfo {
-    room_id: u64,
+    room_id: usize,
     players: Vec<SClient>,
 }
 
@@ -77,8 +77,7 @@ enum ClientState {
 }
 
 async fn progress(peer_id: Token, event: &ClientMessage) {
-    let mut guard = SHARED_STATE.lock().await;
-    let peer_state = guard.clients[&peer_id].state;
+    let peer_state = SHARED_STATE.lock().await.clients[&peer_id].state;
 
     let playing_conditions = false;
 
@@ -90,69 +89,114 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
         }
     };
 
-    macro_rules! send {
-        ($msg:expr) => {{
-            let _ = guard.peers[&peer_id].send($msg);
-        }};
-    }
-
     let new_state = match (&peer_state, &event) {
         (ClientState::Mute, ClientMessage::Login { version, login }) => {
             //send(CError(format!("{}", version.is_recent())))
             if *version < 42 {
-                send!(ServerMessage::Error(Some(format!(
-                    "{}, your client version is less than required.",
-                    login
-                ))));
+                let _ = SHARED_STATE.lock().await.peers[&peer_id].send(ServerMessage::Error(Some(
+                    format!("{}, your client version is less than required.", login),
+                )));
                 ClientState::Mute
             } else {
+                SHARED_STATE
+                    .lock()
+                    .await
+                    .clients
+                    .get_mut(&peer_id)
+                    .unwrap()
+                    .login = login.clone();
                 ClientState::Logined
             }
         }
         (ClientState::Logined, ClientMessage::Settings { quick_play, side }) => {
+            let mut guard = SHARED_STATE.lock().await;
+            guard.clients.get_mut(&peer_id).unwrap().side = *side;
             if *quick_play {
-                //for i in rooms.public
-                // if playing_conditions{
-                //  addtoRoom()
-                //  send(SRoomInfo)
-                //  return ClientState::Playing
-                // }
-                //rooms.public.push(Room::new())
-                //  addtoRoom()
-                // return ClientState::InRoom
-                //--------------
-                playing_check()
-            } else {
-                send!(ServerMessage::Rooms(SRooms {
-                    rooms: vec![
-                        SRoomInfo {
-                            room_id: 12,
-                            players: vec![
-                                SClient {
-                                    login: "fucker".into(),
-                                    side: Side::OnlyX
-                                },
-                                SClient {
-                                    login: "oh hi mark".into(),
-                                    side: Side::Random
-                                }
-                            ]
-                        },
-                        SRoomInfo {
-                            room_id: 99,
-                            players: vec![
-                                SClient {
-                                    login: "test".into(),
-                                    side: Side::Spectator
-                                },
-                                SClient {
-                                    login: "jesus".into(),
-                                    side: Side::PreferO
-                                }
-                            ]
+                let mut rid = NULL_TOKEN;
+                for (room_id, clients) in guard.rooms.public.iter() {
+                    for client in clients {
+                        let other = guard.clients[client].side;
+
+                        if (other == Side::OnlyO && (*side == Side::Random || *side == Side::OnlyX))
+                            || (*side == Side::OnlyO
+                                && (other == Side::Random || other == Side::OnlyX))
+                        {
+                            rid = *room_id;
+                            break;
                         }
-                    ]
+                    }
+                }
+
+                if rid != NULL_TOKEN {
+                    //found playable room
+                    //wrap in function
+                    guard.rooms.public.get_mut(&rid).unwrap().insert(peer_id);
+                    guard.clients.get_mut(&peer_id).unwrap().room = rid;
+                    let _ = guard.peers[&peer_id].send(ServerMessage::RoomInfo(SRoomInfo {
+                        room_id: rid,
+                        players: guard.rooms.public[&rid]
+                            .iter()
+                            .map(|id| SClient {
+                                login: guard.clients[id].login.clone(),
+                                side: guard.clients[id].side,
+                            })
+                            .collect(),
+                    }));
+                    ClientState::Playing
+                } else {
+                    //should create room
+                    let room_id = ROOM_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    let mut clients = BTreeSet::new();
+
+                    clients.insert(peer_id);
+                    guard.clients.get_mut(&peer_id).unwrap().room = room_id;
+
+                    guard.rooms.public.insert(room_id, clients);
+
+                    let _ = guard.peers[&peer_id].send(ServerMessage::RoomInfo(SRoomInfo {
+                        room_id: room_id,
+                        players: guard.rooms.public[&room_id]
+                            .iter()
+                            .map(|id| SClient {
+                                login: guard.clients[id].login.clone(),
+                                side: guard.clients[id].side,
+                            })
+                            .collect(),
+                    }));
+                    ClientState::InRoom
+                }
+
+            //for i in rooms.public
+            // if playing_conditions{
+            //  addtoRoom()
+            //  send(SRoomInfo)
+            //  return ClientState::Playing
+            // }
+            //rooms.public.push(Room::new())
+            //  addtoRoom()
+            // return ClientState::InRoom
+            //--------------
+            //playing_check()
+            } else {
+                let _ = guard.peers[&peer_id].send(ServerMessage::Rooms(SRooms {
+                    rooms: guard
+                        .rooms
+                        .public
+                        .iter()
+                        .chain(guard.rooms.private.iter())
+                        .map(|(room_id, clients)| SRoomInfo {
+                            room_id: *room_id,
+                            players: clients
+                                .iter()
+                                .map(|id| SClient {
+                                    login: guard.clients[id].login.clone(),
+                                    side: guard.clients[id].side,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
                 }));
+
                 ClientState::InLobby
                 //send SRooms
             }
@@ -166,7 +210,13 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
         _ => return,
     };
 
-    guard.clients.get_mut(&peer_id).unwrap().state = new_state;
+    SHARED_STATE
+        .lock()
+        .await
+        .clients
+        .get_mut(&peer_id)
+        .unwrap()
+        .state = new_state;
 }
 
 #[macro_use]
@@ -226,8 +276,14 @@ static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(NULL_TOKEN + 1);
 /// message is received from a client, it is broadcasted to all peers by
 /// iterating over the `peers` entries and sending a copy of the message on each
 /// `Tx`.
+
+struct Rooms {
+    private: HashMap<Token, BTreeSet<Token>>,
+    public: HashMap<Token, BTreeSet<Token>>,
+}
+
 struct Shared {
-    rooms: HashMap<Token, BTreeSet<Token>>,
+    rooms: Rooms,
     peers: HashMap<Token, Tx>,
     clients: HashMap<Token, Client>,
 }
@@ -236,7 +292,9 @@ struct Shared {
 struct Client {
     id: Token,
 
+    login: String,
     state: ClientState,
+    side: Side,
     room: Token,
 }
 
@@ -271,7 +329,10 @@ impl Shared {
     /// Create a new, empty, instance of `Shared`.
     fn new() -> Self {
         Shared {
-            rooms: HashMap::new(),
+            rooms: Rooms {
+                private: HashMap::new(),
+                public: HashMap::new(),
+            },
             peers: HashMap::new(),
             clients: HashMap::new(),
         }
@@ -279,8 +340,8 @@ impl Shared {
 
     // Send a `LineCodec` encoded message to every peer, except
     // for the sender.
-    async fn broadcast(&mut self, room_id: Token, sender: Token, message: ServerMessage) {
-        for client_id in self.rooms[&room_id].iter() {
+    async fn broadcast(&mut self, room: &BTreeSet<Token>, sender: Token, message: ServerMessage) {
+        for client_id in room.iter() {
             if *client_id != sender {
                 //sending in Tx for Rx to recieve
                 let _ = self.peers[client_id].send(message.clone());
@@ -309,6 +370,8 @@ impl Peer {
             Client {
                 id: peer_id,
 
+                login: String::new(),
+                side: Side::Random,
                 state: ClientState::Mute,
                 room: NULL_TOKEN,
             },
@@ -411,7 +474,7 @@ async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Erro
             Ok(Message::ToClient(msg)) => {
                 //println!("#recived: sending '{}' to socket of {}", msg, addr);
                 peer.lines
-                    .send(serde_json::to_string(&msg).unwrap())
+                    .send("server: ".to_owned() + &serde_json::to_string(&msg).unwrap())
                     .await?;
             }
             Err(e) => {
