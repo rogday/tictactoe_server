@@ -35,9 +35,14 @@ enum ClientMessage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+enum ServerError {
+    VersionMismatch,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum ServerMessage {
-    //TODO: Server error in a string, really?
-    Error(Option<String>),
+    State(ClientState),
+    Error(ServerError),
     RoomInfo(SRoomInfo),
     Rooms(SRooms),
     Incoming(SClient),
@@ -68,7 +73,7 @@ struct SRooms {
     rooms: Vec<SRoomInfo>,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 enum ClientState {
     Fresh,
     Logined,
@@ -77,25 +82,21 @@ enum ClientState {
     Playing,
 }
 
-async fn version_check(peer_id: Token, version: &i64, login: &str) -> ClientState {
-    if *version < 42 {
-        //TODO: make enum variant for this case and don't send plain string wtf
-        let _ = SHARED_STATE.write().await.peers[&peer_id].send(ServerMessage::Error(Some(
-            format!("{}, your client version is less than required.", login),
-        )));
+macro_rules! g_write {
+    () => {{
+        SHARED_STATE.write().await
+    }};
+}
 
-        //TODO: why would you keep the connection with this client?
-        ClientState::Fresh
-    } else {
-        //discord-like logins will do
-        SHARED_STATE.write().await.clients.get_mut(&peer_id).unwrap().login = login.to_string();
-        ClientState::Logined
-    }
+macro_rules! g_read {
+    () => {{
+        SHARED_STATE.read().await
+    }};
 }
 
 async fn progress(peer_id: Token, event: &ClientMessage) {
     //TODO: server should send state back to client, so that it knows we're still up.
-    let peer_state = SHARED_STATE.read().await.clients[&peer_id].state;
+    let peer_state = g_read!().clients[&peer_id].state;
 
     //TODO: function; if two clients in a room are ready, should be checked inside (InRoom, Ready)
     let _playing_check = || {};
@@ -103,26 +104,35 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
     //TODO: the fuck is this dispatch, make functions for every arm
     let new_state = match (&peer_state, &event) {
         (ClientState::Fresh, ClientMessage::Login { version, login }) => {
-            version_check(peer_id, version, login).await
+            g_write!().version_check(peer_id, *version, login).0
         }
         (ClientState::Logined, ClientMessage::Settings { quick_play }) => {
-            let mut guard = SHARED_STATE.write().await;
-
             let (state, msg) = if *quick_play {
-                let room_id = guard.find_room_to_play().unwrap_or_else(|| guard.create_room());
-                guard.insert_in_room(room_id, peer_id);
+                let room_id = {
+                    //Note: lock guard will be dropped after the match if you do match guard{...}
+                    let room_id = g_read!().find_room_to_play();
 
-                (ClientState::InRoom, ServerMessage::RoomInfo(guard.describe_room(room_id)))
+                    let room_id = match room_id {
+                        Some(id) => id,
+                        None => g_write!().create_room(),
+                    };
+
+                    g_write!().insert_in_room(room_id, peer_id);
+
+                    room_id
+                };
+
+                (ClientState::InRoom, ServerMessage::RoomInfo(g_read!().describe_room(room_id)))
             } else {
-                (ClientState::InLobby, ServerMessage::Rooms(guard.describe_lobby()))
+                (ClientState::InLobby, ServerMessage::Rooms(g_read!().describe_lobby()))
             };
 
-            guard.send(peer_id, msg);
+            g_write!().send(peer_id, msg);
 
             state
         }
 
-        (ClientState::InLobby, ClientMessage::Room { .. }) => {
+        (ClientState::InLobby, ClientMessage::Room { room_id }) => {
             //check if this room_id exists, otherwise send CError
             //send SRoomInfo
 
@@ -137,7 +147,7 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
         }
     };
 
-    SHARED_STATE.write().await.clients.get_mut(&peer_id).unwrap().state = new_state;
+    g_write!().clients.get_mut(&peer_id).unwrap().state = new_state;
 }
 
 use once_cell::sync::Lazy;
@@ -202,6 +212,24 @@ impl Shared {
         }
     }
 
+    //TODO: different functions
+    fn version_check(
+        &mut self,
+        peer_id: Token,
+        version: i64,
+        login: &str,
+    ) -> (ClientState, ServerMessage) {
+        if version < 42 {
+            (ClientState::Fresh, ServerMessage::Error(ServerError::VersionMismatch))
+        } else {
+            //discord-like logins will do
+            self.clients.get_mut(&peer_id).unwrap().login = login.to_string();
+
+            let state = ClientState::Logined;
+            (state, ServerMessage::State(state))
+        }
+    }
+
     fn find_room_to_play(&self) -> Option<Token> {
         let mut ret = None;
 
@@ -239,6 +267,9 @@ impl Shared {
 
     //TODO: distinct types for room id and client id to ensure compile-time error just in case
     fn insert_in_room(&mut self, room_id: Token, peer_id: Token) {
+        //TODO: 1.broadcast to all participants in this room
+        //2.actually insert client
+
         self.rooms.0.get_mut(&room_id).unwrap().insert(peer_id);
         self.clients.get_mut(&peer_id).unwrap().room = Some(room_id);
     }
@@ -319,7 +350,7 @@ impl Peer {
 
         let peer_id = PEER_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        SHARED_STATE.write().await.insert_client(peer_id, tx);
+        g_write!().insert_client(peer_id, tx);
 
         Ok(Peer { id: peer_id, lines, rx })
     }
@@ -387,12 +418,7 @@ async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Erro
             Ok(Message::FromClient(msg)) => {
                 progress(peer.id, &msg).await;
 
-                debug!(
-                    "{} [{:?}] => {:?}",
-                    addr,
-                    msg,
-                    SHARED_STATE.read().await.clients[&peer.id].state
-                );
+                debug!("{} [{:?}] => {:?}", addr, msg, g_read!().clients[&peer.id].state);
             }
             // A message was received from a peer. Send it to the current user.
             Ok(Message::ToClient(msg)) => {
@@ -411,7 +437,7 @@ async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Erro
     // If this section is reached it means that the client was disconnected!
     // Let's let everyone still connected know about it.
     {
-        SHARED_STATE.write().await.remove_client(peer.id);
+        g_write!().remove_client(peer.id);
         trace!("{} has left the server", addr);
     }
 
