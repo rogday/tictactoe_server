@@ -1,10 +1,10 @@
 {"Login": {"version": 42, "login": "tester"}}
-{"Settings": {"quick_play": false, "side": "Spectator"}}
+{"Settings": {"quick_play": false}}
 {"Room": {"room_id": 228}}
 
 
 {"Login": {"version": 58, "login": "jesus"}}
-{"Settings": {"quick_play": true, "side": "OnlyX"}}
+{"Settings": {"quick_play": true}}
 
 {"Login": {"version": 228, "login": "rogday"}}
-{"Settings": {"quick_play": true, "side": "OnlyO"}}
+{"Settings": {"quick_play": true}}

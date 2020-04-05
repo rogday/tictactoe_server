@@ -1,9 +1,6 @@
-//TODO: what is this 2018 idioms?
-//#![warn(rust_2018_idioms)]
-
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, RwLock},
 };
 
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
@@ -25,12 +22,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+//logging
+use log::LevelFilter;
+use log::{debug, error, info, trace, warn};
+
 #[derive(Serialize, Deserialize, Debug)]
 enum ClientMessage {
     Login { version: i64, login: String },
-    Settings { quick_play: bool, side: Side },
+    Settings { quick_play: bool },
     Room { room_id: i64 },
-    //TODO: Ready button as soon as there are two players in a room
+    Ready,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -42,14 +43,10 @@ enum ServerMessage {
     Incoming(SClient),
 }
 
-//TODO: delete this "OnlyWhatever" shit and refactor your spaghetti who the fuck do you think you are?
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
-    //PreferX,
-    //PreferO,
-    OnlyX,
-    OnlyO,
-    Random,
+    X,
+    O,
     Spectator,
 }
 
@@ -73,201 +70,99 @@ struct SRooms {
 
 #[derive(Debug, Copy, Clone)]
 enum ClientState {
-    //TODO: Fresh, not Mute
-    Mute,
+    Fresh,
     Logined,
     InLobby,
     InRoom,
     Playing,
 }
 
+async fn version_check(peer_id: Token, version: &i64, login: &str) -> ClientState {
+    if *version < 42 {
+        //TODO: make enum variant for this case and don't send plain string wtf
+        let _ = SHARED_STATE.write().await.peers[&peer_id].send(ServerMessage::Error(Some(
+            format!("{}, your client version is less than required.", login),
+        )));
+
+        //TODO: why would you keep the connection with this client?
+        ClientState::Fresh
+    } else {
+        //discord-like logins will do
+        SHARED_STATE.write().await.clients.get_mut(&peer_id).unwrap().login = login.to_string();
+        ClientState::Logined
+    }
+}
+
 async fn progress(peer_id: Token, event: &ClientMessage) {
     //TODO: server should send state back to client, so that it knows we're still up.
-    let peer_state = SHARED_STATE.lock().await.clients[&peer_id].state;
+    let peer_state = SHARED_STATE.read().await.clients[&peer_id].state;
 
-    let playing_conditions = false;
-
-    //TODO: function
-    let playing_check = || {
-        if playing_conditions {
-            ClientState::Playing
-        } else {
-            ClientState::InRoom
-        }
-    };
+    //TODO: function; if two clients in a room are ready, should be checked inside (InRoom, Ready)
+    let _playing_check = || {};
 
     //TODO: the fuck is this dispatch, make functions for every arm
     let new_state = match (&peer_state, &event) {
-        (ClientState::Mute, ClientMessage::Login { version, login }) => {
-            //send(CError(format!("{}", version.is_recent())))
-            if *version < 42 {
-                //TODO: make enum variant for this case and don't send plain string wtf
-                let _ = SHARED_STATE.lock().await.peers[&peer_id].send(ServerMessage::Error(Some(
-                    format!("{}, your client version is less than required.", login),
-                )));
-
-                //TODO: why would you keep the connection with this client?
-                ClientState::Mute
-            } else {
-                //TODO: discord-like logins will do
-                SHARED_STATE.lock().await.clients.get_mut(&peer_id).unwrap().login = login.clone();
-                ClientState::Logined
-            }
+        (ClientState::Fresh, ClientMessage::Login { version, login }) => {
+            version_check(peer_id, version, login).await
         }
-        (ClientState::Logined, ClientMessage::Settings { quick_play, side }) => {
-            let mut guard = SHARED_STATE.lock().await;
-            guard.clients.get_mut(&peer_id).unwrap().side = *side;
-            if *quick_play {
-                let mut rid = NULL_TOKEN;
-                //TODO: marked for removal, choose any non-playing room
+        (ClientState::Logined, ClientMessage::Settings { quick_play }) => {
+            let mut guard = SHARED_STATE.write().await;
 
-                for (room_id, clients) in guard.rooms.public.iter() {
-                    for client in clients {
-                        let other = guard.clients[client].side;
+            let (state, msg) = if *quick_play {
+                let room_id = guard.find_room_to_play().unwrap_or_else(|| guard.create_room());
+                guard.insert_in_room(room_id, peer_id);
 
-                        if (other == Side::OnlyO && (*side == Side::Random || *side == Side::OnlyX))
-                            || (*side == Side::OnlyO
-                                && (other == Side::Random || other == Side::OnlyX))
-                        {
-                            rid = *room_id;
-                            break;
-                        }
-                    }
-                }
-
-                if rid != NULL_TOKEN {
-                    //found playable room
-                    //TODO: adding player to a room should be wrapped in function
-                    guard.rooms.public.get_mut(&rid).unwrap().insert(peer_id);
-                    guard.clients.get_mut(&peer_id).unwrap().room = rid;
-                    let _ = guard.peers[&peer_id].send(ServerMessage::RoomInfo(SRoomInfo {
-                        room_id: rid,
-                        players: guard.rooms.public[&rid]
-                            .iter()
-                            .map(|id| SClient {
-                                login: guard.clients[id].login.clone(),
-                                side:  guard.clients[id].side,
-                            })
-                            .collect(),
-                    }));
-                    ClientState::Playing
-                } else {
-                    //TODO: room creation FUNCTION
-                    let room_id = ROOM_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    let mut clients = BTreeSet::new();
-
-                    clients.insert(peer_id);
-                    guard.clients.get_mut(&peer_id).unwrap().room = room_id;
-
-                    guard.rooms.public.insert(room_id, clients);
-
-                    //TODO: room describing function
-                    let _ = guard.peers[&peer_id].send(ServerMessage::RoomInfo(SRoomInfo {
-                        room_id: room_id,
-                        players: guard.rooms.public[&room_id]
-                            .iter()
-                            .map(|id| SClient {
-                                login: guard.clients[id].login.clone(),
-                                side:  guard.clients[id].side,
-                            })
-                            .collect(),
-                    }));
-                    ClientState::InRoom
-                }
-
-            //for i in rooms.public
-            // if playing_conditions{
-            //  addtoRoom()
-            //  send(SRoomInfo)
-            //  return ClientState::Playing
-            // }
-            //rooms.public.push(Room::new())
-            //  addtoRoom()
-            // return ClientState::InRoom
-            //--------------
-            //playing_check()
+                (ClientState::InRoom, ServerMessage::RoomInfo(guard.describe_room(room_id)))
             } else {
-                //Slow play
+                (ClientState::InLobby, ServerMessage::Rooms(guard.describe_lobby()))
+            };
 
-                //TODO: lobby describing function
-                let _ = guard.peers[&peer_id].send(ServerMessage::Rooms(SRooms {
-                    rooms: guard
-                        .rooms
-                        .public
-                        .iter()
-                        .chain(guard.rooms.private.iter())
-                        .map(|(room_id, clients)| SRoomInfo {
-                            room_id: *room_id,
-                            players: clients
-                                .iter()
-                                .map(|id| SClient {
-                                    login: guard.clients[id].login.clone(),
-                                    side:  guard.clients[id].side,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                }));
+            guard.send(peer_id, msg);
 
-                ClientState::InLobby
-                //send SRooms
-            }
+            state
         }
 
         (ClientState::InLobby, ClientMessage::Room { .. }) => {
             //check if this room_id exists, otherwise send CError
             //send SRoomInfo
-            //TODO: Not playing check. You are waiting for client to send Ready from InLobby state with another player
-            playing_check()
+
+            ClientState::InRoom
         }
 
-        //TODO: not println, not eprintln, not even fucking panic. Use logging crate with lots of shittiest colors ffs.
-        case => panic!("you're not handling case {:?}", case),
+        (ClientState::InRoom, ClientMessage::Ready) => todo!(),
+
+        case => {
+            error!("you're not handling case {:?}", case);
+            return;
+        }
     };
 
-    SHARED_STATE.lock().await.clients.get_mut(&peer_id).unwrap().state = new_state;
+    SHARED_STATE.write().await.clients.get_mut(&peer_id).unwrap().state = new_state;
 }
 
-//TODO: What the actual fuck? Are you using 2015 version of rust or am I missing something?
-#[macro_use]
-extern crate lazy_static;
-
-// Create the shared state. This is how all the peers communicate.
-//
-// The server task will hold a handle to this. For every new client, the
-// `state` handle is cloned and passed into the task that processes the
-// client connection.
-
-//TODO: once_cell
-lazy_static! {
-    static ref SHARED_STATE: Mutex<Shared> = Mutex::new(Shared::new());
-}
+use once_cell::sync::Lazy;
+static SHARED_STATE: Lazy<RwLock<Shared>> = Lazy::new(|| RwLock::new(Shared::new()));
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     //TODO: structopt for args handling
-    let addr = env::args().nth(1).unwrap_or("127.0.0.1:6142".to_string());
+    let addr = env::args().nth(1).unwrap_or("127.0.0.1:666".to_string());
 
-    // Bind a TCP listener to the socket address.
-    //
-    // Note that this is the Tokio TcpListener, which is fully async.
+    env_logger::builder()
+        .filter(Some("tictactoe_server"), LevelFilter::Trace)
+        .write_style(env_logger::WriteStyle::Always)
+        .init();
+
     let mut listener = TcpListener::bind(&addr).await?;
 
-    //TODO: logging
-    println!("server running on {}", addr);
+    info!("server running on {}", addr);
 
     loop {
-        // Asynchronously wait for an inbound TcpStream.
         let (stream, addr) = listener.accept().await?;
 
-        // Clone a handle to the `Shared` state for the new connection.
-        //let state = Arc::clone(&SHARED_STATE);
-
-        // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
             if let Err(e) = process(stream, addr).await {
-                //TODO: logging
-                println!("an error occured; error = {:?}", e);
+                warn!("Error processing {}: {:?}", addr, e);
             }
         });
     }
@@ -280,26 +175,12 @@ type Tx = mpsc::UnboundedSender<ServerMessage>;
 type Rx = mpsc::UnboundedReceiver<ServerMessage>;
 
 type Token = usize;
-//TODO: the fuck is this shit? Option<Token>
-const NULL_TOKEN: Token = 0;
 
 //TODO: factory with fucking local counter?????
-static PEER_COUNTER: AtomicUsize = AtomicUsize::new(NULL_TOKEN + 1);
-static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(NULL_TOKEN + 1);
+static PEER_COUNTER: AtomicUsize = AtomicUsize::new(1);
+static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
-/// Data that is shared between all peers in the server.
-///
-/// This is the set of `Tx` handles for all connected clients. Whenever a
-/// message is received from a client, it is broadcasted to all peers by
-/// iterating over the `peers` entries and sending a copy of the message on each
-/// `Tx`.
-
-//TODO: fuck private rooms.
-struct Rooms {
-    //TODO: not a fucking BTreeSet. should be a custom struct with methods, containing this fucking tree
-    private: HashMap<Token, BTreeSet<Token>>,
-    public:  HashMap<Token, BTreeSet<Token>>,
-}
+struct Rooms(HashMap<Token, BTreeSet<Token>>);
 
 struct Shared {
     rooms:   Rooms,
@@ -307,15 +188,113 @@ struct Shared {
     clients: HashMap<Token, Client>,
 }
 
+impl Shared {
+    fn new() -> Self {
+        Shared { rooms: Rooms(HashMap::new()), peers: HashMap::new(), clients: HashMap::new() }
+    }
+
+    async fn _broadcast(&mut self, room: &BTreeSet<Token>, sender: Token, message: ServerMessage) {
+        for client_id in room.iter() {
+            if *client_id != sender {
+                //sending in Tx for Rx to recieve
+                let _ = self.peers[client_id].send(message.clone());
+            }
+        }
+    }
+
+    fn find_room_to_play(&self) -> Option<Token> {
+        let mut ret = None;
+
+        for (room_id, clients) in self.rooms.0.iter() {
+            //if there are no players with X/O sides
+            if clients
+                .iter()
+                .map(|client| self.clients[client].side)
+                .filter(|side| side != &Side::Spectator)
+                .count()
+                == 0
+            {
+                //found a room with no active players
+                ret = Some(*room_id);
+                // should empty rooms be automatically removed?
+                if clients.len() > 0 {
+                    break;
+                }
+            }
+        }
+
+        ret
+    }
+
+    fn create_room(&mut self) -> Token {
+        let room_id = ROOM_COUNTER.fetch_add(1, Ordering::SeqCst);
+        self.rooms.0.insert(room_id, BTreeSet::new());
+
+        room_id
+    }
+
+    fn send(&mut self, peer_id: Token, msg: ServerMessage) {
+        let _ = self.peers[&peer_id].send(msg);
+    }
+
+    //TODO: distinct types for room id and client id to ensure compile-time error just in case
+    fn insert_in_room(&mut self, room_id: Token, peer_id: Token) {
+        self.rooms.0.get_mut(&room_id).unwrap().insert(peer_id);
+        self.clients.get_mut(&peer_id).unwrap().room = Some(room_id);
+    }
+
+    ///Add client internally
+    fn insert_client(&mut self, peer_id: Token, tx: Tx) {
+        self.peers.insert(peer_id, tx);
+        self.clients.insert(
+            peer_id,
+            Client {
+                id: peer_id,
+
+                login: String::new(),
+                side:  Side::Spectator,
+                state: ClientState::Fresh,
+                room:  None,
+            },
+        );
+    }
+
+    fn remove_client(&mut self, peer_id: Token) {
+        if let Some(room_id) = self.clients.get_mut(&peer_id).unwrap().room {
+            self.rooms.0.get_mut(&room_id).unwrap().remove(&peer_id);
+        }
+
+        self.clients.remove(&peer_id);
+        self.peers.remove(&peer_id);
+    }
+
+    fn describe_lobby(&self) -> SRooms {
+        SRooms { rooms: self.rooms.0.keys().map(|room_id| self.describe_room(*room_id)).collect() }
+    }
+
+    fn describe_room(&self, rid: Token) -> SRoomInfo {
+        SRoomInfo {
+            room_id: rid,
+            players: self.rooms.0[&rid]
+                .iter()
+                .map(|id| SClient {
+                    login: self.clients[id].login.clone(),
+                    side:  self.clients[id].side,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Client {
     id: Token,
 
-    //TODO: Maybe SmallString?
+    //Maybe SmallString?
     login: String,
     state: ClientState,
     side:  Side,
-    room:  Token,
+    room:  Option<Token>,
 }
 
 impl PartialEq for Client {
@@ -329,71 +308,18 @@ impl Eq for Client {}
 /// The state for each connected client.
 //#[derive(PartialEq, Eq, Debug)]
 struct Peer {
-    id: Token,
-
-    /// The TCP socket wrapped with the `Lines` codec, defined below.
-    ///
-    /// This handles sending and receiving data on the socket. When using
-    /// `Lines`, we can work at the line level instead of having to manage the
-    /// raw byte operations.
+    id:    Token,
     lines: Framed<TcpStream, LinesCodec>,
-
-    /// Receive half of the message channel.
-    ///
-    /// This is used to receive messages from peers. When a message is received
-    /// off of this `Rx`, it will be written to the socket.
-    rx: Rx,
-}
-
-impl Shared {
-    /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
-        Shared {
-            rooms:   Rooms { private: HashMap::new(), public: HashMap::new() },
-            peers:   HashMap::new(),
-            clients: HashMap::new(),
-        }
-    }
-
-    // Send a `LineCodec` encoded message to every peer, except
-    // for the sender.
-    //TODO: broadcast should be inside a room struct.
-    async fn _broadcast(&mut self, room: &BTreeSet<Token>, sender: Token, message: ServerMessage) {
-        for client_id in room.iter() {
-            if *client_id != sender {
-                //sending in Tx for Rx to recieve
-                let _ = self.peers[client_id].send(message.clone());
-            }
-        }
-    }
+    rx:    Rx,
 }
 
 impl Peer {
-    /// Create a new instance of `Peer`.
     async fn new(lines: Framed<TcpStream, LinesCodec>) -> io::Result<Peer> {
-        // Get the client socket address
-        //let addr = lines.get_ref().peer_addr()?;
-
-        // Create a channel for this peer
         let (tx, rx) = mpsc::unbounded_channel();
-
-        // Add an entry for this `Peer` in the shared state map.
-        //state.lock().await.peers.insert(addr, tx);
 
         let peer_id = PEER_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        SHARED_STATE.lock().await.peers.insert(peer_id, tx);
-        SHARED_STATE.lock().await.clients.insert(
-            peer_id,
-            Client {
-                id: peer_id,
-
-                login: String::new(),
-                side:  Side::Random,
-                state: ClientState::Mute,
-                room:  NULL_TOKEN,
-            },
-        );
+        SHARED_STATE.write().await.insert_client(peer_id, tx);
 
         Ok(Peer { id: peer_id, lines, rx })
     }
@@ -401,16 +327,10 @@ impl Peer {
 
 #[derive(Debug)]
 enum Message {
-    /// A message that should be broadcasted to others.
-    //Broadcast(ClientMessage),
-
-    /// A message that should be received by a client
     FromClient(ClientMessage),
     ToClient(ServerMessage),
 }
 
-// Peer implements `Stream` in a way that polls both the `Rx`, and `Framed` types.
-// A message is produced whenever an event is ready until the `Framed` stream returns `None`.
 impl Stream for Peer {
     type Item = Result<Message, LinesCodecError>;
 
@@ -432,7 +352,8 @@ impl Stream for Peer {
                 if let Ok(event) = serde_json::from_str::<ClientMessage>(&message) {
                     Some(Ok(Message::FromClient(event)))
                 } else {
-                    //TODO: whoe the fuck cares about this error?
+                    warn!("unparseable message from client: '{}'", message);
+                    //TODO: who the fuck cares about this error?
                     Some(Err(LinesCodecError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "cant parse input",
@@ -451,57 +372,37 @@ impl Stream for Peer {
 
 /// Process an individual client
 async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Error>> {
-    //TODO: I can send you \n in login string and you will fuck off. Also I think json supports pretty print?
+    //I can send you \n in login string and you will fuck off. Also I think json supports pretty print?
+    //Let's say our protocol forbids \n inside a login
     let lines = Framed::new(stream, LinesCodec::new());
 
-    // Register our peer with state which internally sets up some channels.
     let mut peer = Peer::new(lines).await?;
 
-    // A client has connected, let's let everyone know.
-    {
-        //let mut state = state.lock().await;
-        //TODO: logging
-        let msg = format!("{} has joined the server", addr);
-        println!("{}", msg);
-        //state.broadcast(addr, msg).await;
-    }
+    trace!("{} has joined the server", addr);
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     while let Some(result) = peer.next().await {
         match result {
-            // A message was received from the current user, we should
-            // broadcast this message to the other users.
+            // A message was received from the current user, we should broadcast this message to the other users.
             Ok(Message::FromClient(msg)) => {
-                //let msg = format!("{}: {}", username, msg);
-                //let peer_state = &mut shared_state.clients.get_mut(&peer.id).unwrap().state;
                 progress(peer.id, &msg).await;
 
-                //TODO: logging
-                println!(
+                debug!(
                     "{} [{:?}] => {:?}",
                     addr,
                     msg,
-                    SHARED_STATE.lock().await.clients[&peer.id].state
+                    SHARED_STATE.read().await.clients[&peer.id].state
                 );
-
-                //println!("#broadcast: sending '{}' from {}", msg, addr);
-                //state.broadcast(addr, msg).await;
             }
-            // A message was received from a peer. Send it to the
-            // current user.
+            // A message was received from a peer. Send it to the current user.
             Ok(Message::ToClient(msg)) => {
-                //println!("#recived: sending '{}' to socket of {}", msg, addr);
-                //TODO: dummy shit for ncat output to be readable
+                //dummy shit for ncat output to be readable
                 peer.lines
                     .send("server: ".to_owned() + &serde_json::to_string(&msg).unwrap())
                     .await?;
             }
             Err(e) => {
-                //TODO: logging
-                println!(
-                    "an error occured while processing messages for {}; error = {:?}",
-                    addr, e
-                );
+                warn!("Error processing {}: {:?}", addr, e);
                 break;
             }
         }
@@ -510,16 +411,8 @@ async fn process(stream: TcpStream, addr: SocketAddr) -> Result<(), Box<dyn Erro
     // If this section is reached it means that the client was disconnected!
     // Let's let everyone still connected know about it.
     {
-        let mut guard = SHARED_STATE.lock().await;
-
-        //TODO: peer remover, room leaver etc
-        guard.clients.remove(&peer.id);
-        guard.peers.remove(&peer.id);
-
-        //TODO: logging
-        let msg = format!("{} has left the server", addr);
-        println!("{}", msg);
-        //state.broadcast(addr, msg).await;
+        SHARED_STATE.write().await.remove_client(peer.id);
+        trace!("{} has left the server", addr);
     }
 
     Ok(())
