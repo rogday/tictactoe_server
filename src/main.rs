@@ -39,6 +39,7 @@ enum ServerResult {
     Success,
     VersionMismatch,
     RoomNotFound,
+    OthersAlreadyPlaying,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -158,22 +159,25 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
                 let guard = g_read!();
 
                 let room_id = guard.clients[&peer_id].room.unwrap();
-
-                let readied = 1 + guard.rooms.0[&room_id]
-                    .iter()
-                    .filter(|id| guard.clients[id].state == ClientState::Ready)
-                    .count();
+                let readied = guard.rooms.0[&room_id].1.len();
 
                 (room_id, readied)
             };
 
-            debug!("readied: {}", readied);
-
-            let tmp = if readied == 2 {
-                //TODO: find second client and change his state as well
-                (ClientState::Playing, ServerMessage::Playing(peer_id))
-            } else {
-                (ClientState::Ready, ServerMessage::Ready(peer_id))
+            use std::cmp::Ordering;
+            let tmp = match readied.cmp(&1) {
+                Ordering::Less => {
+                    g_write!().rooms.0.get_mut(&room_id).unwrap().1.push(peer_id);
+                    (ClientState::Ready, ServerMessage::Ready(peer_id))
+                }
+                Ordering::Equal => {
+                    g_write!().rooms.0.get_mut(&room_id).unwrap().1.push(peer_id);
+                    (ClientState::Playing, ServerMessage::Playing(peer_id))
+                }
+                Ordering::Greater => (
+                    ClientState::InRoom,
+                    ServerMessage::ReqResult(ServerResult::OthersAlreadyPlaying),
+                ),
             };
 
             g_write!().broadcast_except(room_id, peer_id, tmp.1);
@@ -231,8 +235,10 @@ type Token = usize;
 static PEER_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
+use staticvec::StaticVec;
+
 //TODO: use some kind of newtype & write an impl
-struct Rooms(HashMap<Token, BTreeSet<Token>>);
+struct Rooms(HashMap<Token, (BTreeSet<Token>, StaticVec<Token, 2>)>);
 
 struct Shared {
     rooms:   Rooms,
@@ -268,6 +274,7 @@ impl Shared {
         for (room_id, clients) in self.rooms.0.iter() {
             //if there are no players with X/O sides
             if clients
+                .0
                 .iter()
                 .map(|client| self.clients[client].side)
                 .filter(|side| side != &Side::Spectator)
@@ -277,7 +284,7 @@ impl Shared {
                 //found a room with no active players
                 ret = Some(*room_id);
                 // should empty rooms be automatically removed?
-                if clients.len() > 0 {
+                if clients.0.len() > 0 {
                     break;
                 }
             }
@@ -288,7 +295,7 @@ impl Shared {
 
     fn create_room(&mut self) -> Token {
         let room_id = ROOM_COUNTER.fetch_add(1, Ordering::SeqCst);
-        self.rooms.0.insert(room_id, BTreeSet::new());
+        self.rooms.0.insert(room_id, (BTreeSet::new(), StaticVec::default()));
 
         room_id
     }
@@ -298,7 +305,7 @@ impl Shared {
     }
 
     fn broadcast_except(&mut self, room_id: Token, peer_id: Token, msg: ServerMessage) {
-        for client_id in self.rooms.0[&room_id].iter() {
+        for client_id in self.rooms.0[&room_id].0.iter() {
             if client_id != &peer_id {
                 let _ = self.peers[client_id].send(msg.clone());
             }
@@ -307,7 +314,7 @@ impl Shared {
 
     //TODO: copy-paste
     fn broadcast(&mut self, room_id: Token, msg: ServerMessage) {
-        for client_id in self.rooms.0[&room_id].iter() {
+        for client_id in self.rooms.0[&room_id].0.iter() {
             let _ = self.peers[client_id].send(msg.clone());
         }
     }
@@ -318,7 +325,7 @@ impl Shared {
         self.broadcast(room_id, ServerMessage::Incoming(self.get_client_info(peer_id)));
 
         //2.actually insert client
-        self.rooms.0.get_mut(&room_id).unwrap().insert(peer_id);
+        self.rooms.0.get_mut(&room_id).unwrap().0.insert(peer_id);
         self.clients.get_mut(&peer_id).unwrap().room = Some(room_id);
     }
 
@@ -339,8 +346,11 @@ impl Shared {
     }
 
     fn remove_client(&mut self, peer_id: Token) {
-        if let Some(room_id) = self.clients.get_mut(&peer_id).unwrap().room {
-            self.rooms.0.get_mut(&room_id).unwrap().remove(&peer_id);
+        if let Some(room_id) = self.clients[&peer_id].room {
+            if self.clients[&peer_id].state == ClientState::Playing {
+                self.rooms.0.get_mut(&room_id).unwrap().1.remove_item(&peer_id);
+            }
+            self.rooms.0.get_mut(&room_id).unwrap().0.remove(&peer_id);
         }
 
         self.clients.remove(&peer_id);
@@ -358,7 +368,7 @@ impl Shared {
     fn describe_room(&self, rid: Token) -> SRoomInfo {
         SRoomInfo {
             room_id: rid,
-            players: self.rooms.0[&rid].iter().map(|&id| self.get_client_info(id)).collect(),
+            players: self.rooms.0[&rid].0.iter().map(|&id| self.get_client_info(id)).collect(),
         }
     }
 }
