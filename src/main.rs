@@ -30,22 +30,27 @@ use log::{debug, error, info, trace, warn};
 enum ClientMessage {
     Login { version: i64, login: String },
     Settings { quick_play: bool },
-    Room { room_id: i64 },
+    Room { room_id: Token },
     Ready,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-enum ServerError {
+enum ServerResult {
+    Success,
     VersionMismatch,
+    RoomNotFound,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum ServerMessage {
-    State(ClientState),
-    Error(ServerError),
+    ReqResult(ServerResult),
     RoomInfo(SRoomInfo),
     Rooms(SRooms),
     Incoming(SClient),
+
+    //TODO: refactor
+    Ready(Token),
+    Playing(Token),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +62,7 @@ enum Side {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SClient {
+    id:    Token,
     login: String,
     side:  Side,
 }
@@ -73,12 +79,13 @@ struct SRooms {
     rooms: Vec<SRoomInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 enum ClientState {
     Fresh,
     Logined,
     InLobby,
     InRoom,
+    Ready,
     Playing,
 }
 
@@ -102,12 +109,12 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
     let _playing_check = || {};
 
     //TODO: the fuck is this dispatch, make functions for every arm
-    let new_state = match (&peer_state, &event) {
+    let (new_state, msg) = match (&peer_state, &event) {
         (ClientState::Fresh, ClientMessage::Login { version, login }) => {
-            g_write!().version_check(peer_id, *version, login).0
+            g_write!().version_check(peer_id, *version, login)
         }
         (ClientState::Logined, ClientMessage::Settings { quick_play }) => {
-            let (state, msg) = if *quick_play {
+            if *quick_play {
                 let room_id = {
                     //Note: lock guard will be dropped after the match if you do match guard{...}
                     let room_id = g_read!().find_room_to_play();
@@ -125,21 +132,54 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
                 (ClientState::InRoom, ServerMessage::RoomInfo(g_read!().describe_room(room_id)))
             } else {
                 (ClientState::InLobby, ServerMessage::Rooms(g_read!().describe_lobby()))
-            };
-
-            g_write!().send(peer_id, msg);
-
-            state
+            }
         }
 
         (ClientState::InLobby, ClientMessage::Room { room_id }) => {
-            //check if this room_id exists, otherwise send CError
-            //send SRoomInfo
+            let exists = g_read!().rooms.0.contains_key(room_id);
 
-            ClientState::InRoom
+            match exists {
+                true => {
+                    g_write!().insert_in_room(*room_id, peer_id);
+
+                    (
+                        ClientState::InRoom,
+                        ServerMessage::RoomInfo(g_read!().describe_room(*room_id)),
+                    )
+                }
+                false => {
+                    (ClientState::InLobby, ServerMessage::ReqResult(ServerResult::RoomNotFound))
+                }
+            }
         }
 
-        (ClientState::InRoom, ClientMessage::Ready) => todo!(),
+        (ClientState::InRoom, ClientMessage::Ready) => {
+            let (room_id, readied) = {
+                let guard = g_read!();
+
+                let room_id = guard.clients[&peer_id].room.unwrap();
+
+                let readied = 1 + guard.rooms.0[&room_id]
+                    .iter()
+                    .filter(|id| guard.clients[id].state == ClientState::Ready)
+                    .count();
+
+                (room_id, readied)
+            };
+
+            debug!("readied: {}", readied);
+
+            let tmp = if readied == 2 {
+                //TODO: find second client and change his state as well
+                (ClientState::Playing, ServerMessage::Playing(peer_id))
+            } else {
+                (ClientState::Ready, ServerMessage::Ready(peer_id))
+            };
+
+            g_write!().broadcast_except(room_id, peer_id, tmp.1);
+
+            (tmp.0, ServerMessage::ReqResult(ServerResult::Success))
+        }
 
         case => {
             error!("you're not handling case {:?}", case);
@@ -148,6 +188,7 @@ async fn progress(peer_id: Token, event: &ClientMessage) {
     };
 
     g_write!().clients.get_mut(&peer_id).unwrap().state = new_state;
+    g_write!().send(peer_id, msg);
 }
 
 use once_cell::sync::Lazy;
@@ -190,6 +231,7 @@ type Token = usize;
 static PEER_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static ROOM_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
+//TODO: use some kind of newtype & write an impl
 struct Rooms(HashMap<Token, BTreeSet<Token>>);
 
 struct Shared {
@@ -203,15 +245,6 @@ impl Shared {
         Shared { rooms: Rooms(HashMap::new()), peers: HashMap::new(), clients: HashMap::new() }
     }
 
-    async fn _broadcast(&mut self, room: &BTreeSet<Token>, sender: Token, message: ServerMessage) {
-        for client_id in room.iter() {
-            if *client_id != sender {
-                //sending in Tx for Rx to recieve
-                let _ = self.peers[client_id].send(message.clone());
-            }
-        }
-    }
-
     //TODO: different functions
     fn version_check(
         &mut self,
@@ -220,13 +253,12 @@ impl Shared {
         login: &str,
     ) -> (ClientState, ServerMessage) {
         if version < 42 {
-            (ClientState::Fresh, ServerMessage::Error(ServerError::VersionMismatch))
+            (ClientState::Fresh, ServerMessage::ReqResult(ServerResult::VersionMismatch))
         } else {
             //discord-like logins will do
             self.clients.get_mut(&peer_id).unwrap().login = login.to_string();
 
-            let state = ClientState::Logined;
-            (state, ServerMessage::State(state))
+            (ClientState::Logined, ServerMessage::ReqResult(ServerResult::Success))
         }
     }
 
@@ -265,11 +297,27 @@ impl Shared {
         let _ = self.peers[&peer_id].send(msg);
     }
 
+    fn broadcast_except(&mut self, room_id: Token, peer_id: Token, msg: ServerMessage) {
+        for client_id in self.rooms.0[&room_id].iter() {
+            if client_id != &peer_id {
+                let _ = self.peers[client_id].send(msg.clone());
+            }
+        }
+    }
+
+    //TODO: copy-paste
+    fn broadcast(&mut self, room_id: Token, msg: ServerMessage) {
+        for client_id in self.rooms.0[&room_id].iter() {
+            let _ = self.peers[client_id].send(msg.clone());
+        }
+    }
+
     //TODO: distinct types for room id and client id to ensure compile-time error just in case
     fn insert_in_room(&mut self, room_id: Token, peer_id: Token) {
-        //TODO: 1.broadcast to all participants in this room
-        //2.actually insert client
+        //1.broadcast to all participants in this room
+        self.broadcast(room_id, ServerMessage::Incoming(self.get_client_info(peer_id)));
 
+        //2.actually insert client
         self.rooms.0.get_mut(&room_id).unwrap().insert(peer_id);
         self.clients.get_mut(&peer_id).unwrap().room = Some(room_id);
     }
@@ -303,16 +351,14 @@ impl Shared {
         SRooms { rooms: self.rooms.0.keys().map(|room_id| self.describe_room(*room_id)).collect() }
     }
 
+    fn get_client_info(&self, id: Token) -> SClient {
+        SClient { id, login: self.clients[&id].login.clone(), side: self.clients[&id].side }
+    }
+
     fn describe_room(&self, rid: Token) -> SRoomInfo {
         SRoomInfo {
             room_id: rid,
-            players: self.rooms.0[&rid]
-                .iter()
-                .map(|id| SClient {
-                    login: self.clients[id].login.clone(),
-                    side:  self.clients[id].side,
-                })
-                .collect(),
+            players: self.rooms.0[&rid].iter().map(|&id| self.get_client_info(id)).collect(),
         }
     }
 }
